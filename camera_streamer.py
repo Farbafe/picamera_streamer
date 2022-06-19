@@ -13,16 +13,28 @@ import datetime
 import time
 import numpy as np
 import subprocess
+import requests
+from dotenv import load_dotenv
+import os
+import telepot
+load_dotenv()
 
-IS_HTTP = True # False uses HTTPS
+TELEGRAM_API = os.getenv('TELEGRAM_API')
+TELEGRAM_ACCOUNT_ID = os.getenv('TELEGRAM_ACCOUNT_ID')
+bot = telepot.Bot(TELEGRAM_API)
+base_url = '/home/pi/'
+
+IS_HTTP = True  # False uses HTTPS
 
 is_movement_detected = False
+movement_sent_timestamp = datetime.datetime.now().timestamp()
 
 motion_dtype = np.dtype([
     ('x', 'i1'),
     ('y', 'i1'),
     ('sad', 'u2'),
-    ])
+])
+
 
 class MyMotionDetector(object):
     def __init__(self, camera):
@@ -31,9 +43,10 @@ class MyMotionDetector(object):
         self.cols += 1
         self.rows = (height + 15) // 16
         # masks to check for movement in a subsection of frame
-        #self.mask = np.zeros((self.rows, self.cols), dtype=np.bool)
-        #self.mask[:,:] = False
-        #self.mask[6:,8:32] = True
+        self.mask = np.zeros((self.rows, self.cols), dtype=np.bool)
+        self.mask[:, :] = False
+        self.mask[6:, 8:] = True
+        np.set_printoptions(threshold=np.inf)
 
     def write(self, s):
         global is_movement_detected
@@ -42,26 +55,28 @@ class MyMotionDetector(object):
         data = np.sqrt(
             np.square(data['x'].astype(np.float)) +
             np.square(data['y'].astype(np.float))
-            ).clip(0, 255).astype(np.uint8)
-        # If there're more than 6 vectors with a magnitude greater
+        ).clip(0, 255).astype(np.uint8)
+        # If there're more than 80 vectors with a magnitude greater
         # than 20, then motion is detected
-        if (data > 20).sum() > 6:
+        if (data > 20).sum() > 80:
             is_movement_detected = True
         else:
             is_movement_detected = False
         return len(s)
 
-PAGE="""\
+
+PAGE = """\
 <html>
 <head>
 <title>Raspberry Pi - Surveillance Camera</title>
 </head>
 <body bgcolor="black">
 <center><h1 style="color:DodgerBlue;">Raspberry Pi - Surveillance Camera</h1></center>
-<center><img src="stream.mjpg" width="640" height="480"></center>
+<center><img src="stream.mjpg" width="960" height="540"></center>
 </body>
 </html>
 """
+
 
 class StreamingOutput(object):
     def __init__(self):
@@ -79,6 +94,7 @@ class StreamingOutput(object):
                 self.condition.notify_all()
             self.buffer.seek(0)
         return self.buffer.write(buf)
+
 
 class StreamingHandler(server.BaseHTTPRequestHandler):
     def do_GET(self):
@@ -98,7 +114,8 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             self.send_header('Age', 0)
             self.send_header('Cache-Control', 'no-cache, private')
             self.send_header('Pragma', 'no-cache')
-            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
+            self.send_header(
+                'Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
             self.end_headers()
             try:
                 while True:
@@ -119,32 +136,45 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             self.send_error(404)
             self.end_headers()
 
+
 class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+
 
 def annotate_text(cam):
     while True:
         time.sleep(1)
         cam.annotate_text = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+
 def motion_detector_wait():
+    global movement_sent_timestamp
     while True:
         camera.wait_recording(1, splitter_port=2)
         if is_movement_detected:
             now = datetime.datetime.now().strftime('%Y-%m-%dT%H.%M.%S')
-            filename = '/media/pi/STORAGE/motion/{}_After.h264'.format(now)
+            filename = '{}{}_After.h264'.format(base_url, now)
             camera.split_recording(filename, splitter_port=2)
-            stream.copy_to(filename.replace('After', 'Before'), seconds=10, first_frame=picamera.PiVideoFrameType.sps_header)
+            stream.copy_to(filename.replace('After', 'Before'), seconds=10,
+                first_frame=picamera.PiVideoFrameType.sps_header)
             no_movement_counter = 0
             while is_movement_detected or no_movement_counter < 15:
                 time.sleep(1)
-                no_movement_counter = no_movement_counter + 1 if not is_movement_detected else 0
-            subprocess.call('cat "{1}" "{0}" > "{2}" && rm -f "{0}" "{1}" &'.format(filename, filename.replace('After', 'Before'), filename.replace('After', 'Final')), shell=True)
+                if datetime.datetime.now().timestamp() - movement_sent_timestamp > 10:
+                    camera.capture('capture.jpg', use_video_port=True)                    
+                    bot.sendPhoto(TELEGRAM_ACCOUNT_ID, open('capture.jpg', 'rb'))
+                    movement_sent_timestamp = datetime.datetime.now().timestamp()
+                no_movement_counter += 1 if not is_movement_detected else 0
+                print(f"{no_movement_counter=}")
+            subprocess.call('cat "{1}" "{0}" > "{2}" && rm -f "{0}" "{1}" &'.format(
+                filename, filename.replace('After', 'Before'),
+                filename.replace('After', 'Final')), shell=True)
             stream.clear()
             camera.split_recording(stream, splitter_port=2)
 
-with picamera.PiCamera(resolution='640x480', framerate=24) as camera:
+
+with picamera.PiCamera(resolution='960x540', framerate=13) as camera:
     output = StreamingOutput()
     camera.rotation = 90
     camera.annotate_background = picamera.Color(y=0.1, u=0, v=0)
@@ -152,7 +182,8 @@ with picamera.PiCamera(resolution='640x480', framerate=24) as camera:
     stream = picamera.PiCameraCircularIO(camera, seconds=10, splitter_port=2)
     thread = Thread(target=annotate_text, args=(camera, ))
     camera.start_recording(output, format='mjpeg')
-    camera.start_recording(stream, splitter_port=2, format='h264', motion_output=MyMotionDetector(camera))
+    camera.start_recording(stream, splitter_port=2,
+        format='h264', motion_output=MyMotionDetector(camera))
     thread02 = Thread(target=motion_detector_wait)
     thread.start()
     thread02.start()
@@ -160,7 +191,8 @@ with picamera.PiCamera(resolution='640x480', framerate=24) as camera:
         address = ('', 8070)
         server = StreamingServer(address, StreamingHandler)
         if not IS_HTTP:
-            server.socket = ssl.wrap_socket(server.socket, certfile='/home/pi/fullcert.pem', server_side=True)
+            server.socket = ssl.wrap_socket(
+                server.socket, certfile='/home/pi/fullcert.pem', server_side=True)
         print('Listening on {}'.format(address))
         server.serve_forever()
     finally:
